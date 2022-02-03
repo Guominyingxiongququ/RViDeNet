@@ -11,6 +11,20 @@ from scipy.stats import poisson
 from skimage.measure import compare_psnr,compare_ssim
 import time
 
+def pack_gbrg_raw_rgb(raw):
+    im = raw.astype(np.float32)
+    im = im/np.float32(255)
+
+    im = np.expand_dims(im, axis=2)
+    img_shape = im.shape
+    H = img_shape[0]
+    W = img_shape[1]
+
+    out = np.concatenate((im[1:H:2, 0:W:2, :],
+                          im[1:H:2, 1:W:2, :],
+                          im[0:H:2, 1:W:2, :],
+                          im[0:H:2, 0:W:2, :]), axis=2)
+    return out
 def pack_gbrg_raw(raw):
     #pack GBRG Bayer raw to 4 channels
     black_level = 240
@@ -203,6 +217,113 @@ def test_big_size_raw(input_data, denoiser, patch_h = 256, patch_w = 256, patch_
    
     t1 = time.clock()
     print('Total running time: %s s' % (str(t1 - t0)))
+
+    return test_result
+
+def preprocess_rgb(input_data):
+    # permute axis order from (h, w, c) to (c, h, w)
+    # extend batch channel from (c, h, w) to  (n, c, h, w)
+    # convert numpy array to cuda
+    output_data = np.expand_dims(input_data, axis=0)
+    output_data = torch.from_numpy(output_data.copy()).permute(0, 3, 1, 2).cuda()
+    return output_data
+
+def postprocess_rgb(input_data):
+    # permute axis order from (n, c, h, w) to (n, h, w, c)
+    # convert cuda to numpy array
+    output_data = input_data.permute(0, 2, 3, 1)
+    output_data = output_data.cpu().detach().numpy()
+    return output_data
+
+def test_big_size_rgb(input_data, denoiser, patch_h = 256, patch_w = 256, patch_h_overlap = 64, patch_w_overlap = 64, video=True):
+
+    H = input_data.shape[0]
+    W = input_data.shape[1]
+    
+    # input data shape: h ,w ,3
+    test_result = np.zeros((1, H, W, 3))
+    h_index = 1
+    while (patch_h*h_index-patch_h_overlap*(h_index-1)) < H:
+        test_horizontal_result = np.zeros((1, patch_h,W,3))
+        h_begin = patch_h*(h_index-1)-patch_h_overlap*(h_index-1)
+        h_end = patch_h*h_index-patch_h_overlap*(h_index-1) 
+        w_index = 1
+        while (patch_w*w_index-patch_w_overlap*(w_index-1)) < W:
+            w_begin = patch_w*(w_index-1)-patch_w_overlap*(w_index-1)
+            w_end = patch_w*w_index-patch_w_overlap*(w_index-1)
+            test_patch = input_data[h_begin:h_end,w_begin:w_end,:]               
+            test_patch = preprocess_rgb(test_patch)
+            if video:
+                test_patch = test_patch.reshape(1,3,3,patch_h,patch_w)            
+            with torch.no_grad():
+                output_patch = denoiser(test_patch)
+            test_patch_result = postprocess_rgb(output_patch)
+            if w_index == 1:
+                test_horizontal_result[:,:,w_begin:w_end,:] = test_patch_result
+            else:
+                for i in range(patch_w_overlap):
+                    test_horizontal_result[:,:,w_begin+i,:] = test_horizontal_result[:,:,w_begin+i,:]*(patch_w_overlap-1-i)/(patch_w_overlap-1)+test_patch_result[:,:,i,:]*i/(patch_w_overlap-1)
+                test_horizontal_result[:,:,w_begin+patch_w_overlap:w_end,:] = test_patch_result[:,:,patch_w_overlap:,:]
+            w_index += 1                   
+    
+        test_patch = input_data[h_begin:h_end,-patch_w:,:]         
+        test_patch = preprocess_rgb(test_patch)
+        if video:
+            test_patch = test_patch.reshape(1,3,3,patch_h,patch_w)     
+        with torch.no_grad():
+            output_patch = denoiser(test_patch)
+        test_patch_result = postprocess_rgb(output_patch)       
+        last_range = w_end-(W-patch_w)       
+        for i in range(last_range):
+            test_horizontal_result[:,:,W-patch_w+i,:] = test_horizontal_result[:,:,W-patch_w+i,:]*(last_range-1-i)/(last_range-1)+test_patch_result[:,:,i,:]*i/(last_range-1)
+        test_horizontal_result[:,:,w_end:,:] = test_patch_result[:,:,last_range:,:]       
+
+        if h_index == 1:
+            test_result[:,h_begin:h_end,:,:] = test_horizontal_result
+        else:
+            for i in range(patch_h_overlap):
+                test_result[:,h_begin+i,:,:] = test_result[:,h_begin+i,:,:]*(patch_h_overlap-1-i)/(patch_h_overlap-1)+test_horizontal_result[:,i,:,:]*i/(patch_h_overlap-1)
+            test_result[:,h_begin+patch_h_overlap:h_end,:,:] = test_horizontal_result[:,patch_h_overlap:,:,:] 
+        h_index += 1
+
+    test_horizontal_result = np.zeros((1,patch_h,W,3))
+    w_index = 1
+    while (patch_w*w_index-patch_w_overlap*(w_index-1)) < W:
+        w_begin = patch_w*(w_index-1)-patch_w_overlap*(w_index-1)
+        w_end = patch_w*w_index-patch_w_overlap*(w_index-1)
+        test_patch = input_data[-patch_h:,w_begin:w_end,:]               
+        test_patch = preprocess_rgb(test_patch)
+        if video:
+            test_patch = test_patch.reshape(1,3,3,patch_h,patch_w)                
+        with torch.no_grad():
+            output_patch = denoiser(test_patch)
+        test_patch_result = postprocess_rgb(output_patch)
+        if w_index == 1:
+            test_horizontal_result[:,:,w_begin:w_end,:] = test_patch_result
+        else:
+            for i in range(patch_w_overlap):
+                test_horizontal_result[:,:,w_begin+i,:] = test_horizontal_result[:,:,w_begin+i,:]*(patch_w_overlap-1-i)/(patch_w_overlap-1)+test_patch_result[:,:,i,:]*i/(patch_w_overlap-1)
+            test_horizontal_result[:,:,w_begin+patch_w_overlap:w_end,:] = test_patch_result[:,:,patch_w_overlap:,:]   
+        w_index += 1
+
+    test_patch = input_data[-patch_h:,-patch_w:,:]         
+    test_patch = preprocess_rgb(test_patch)
+    if video:
+        test_patch = test_patch.reshape(1,3,3,patch_h,patch_w)     
+    with torch.no_grad():
+        output_patch = denoiser(test_patch)
+    test_patch_result = postprocess_rgb(output_patch)
+    last_range = w_end-(W-patch_w)       
+    for i in range(last_range):
+        test_horizontal_result[:,:,W-patch_w+i,:] = test_horizontal_result[:,:,W-patch_w+i,:]*(last_range-1-i)/(last_range-1)+test_patch_result[:,:,i,:]*i/(last_range-1) 
+    test_horizontal_result[:,:,w_end:,:] = test_patch_result[:,:,last_range:,:] 
+
+    last_last_range = h_end-(H-patch_h)
+    for i in range(last_last_range):
+        test_result[:,H-patch_w+i,:,:] = test_result[:,H-patch_w+i,:,:]*(last_last_range-1-i)/(last_last_range-1)+test_horizontal_result[:,i,:,:]*i/(last_last_range-1)
+    test_result[:,h_end:,:,:] = test_horizontal_result[:,last_last_range:,:,:]
+   
+    t1 = time.clock()
 
     return test_result
 
